@@ -6,7 +6,7 @@ from datamint.services.auth import authenticate_user, register_user
 
 
 def render_auth_page() -> None:
-    st.title("DataForge AI")
+    st.title("DataMint AI")
     st.caption("Generate realistic synthetic datasets for ML experiments.")
 
     login_tab, register_tab = st.tabs(["Login", "Register"])

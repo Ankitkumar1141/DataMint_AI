@@ -2,124 +2,232 @@ from __future__ import annotations
 
 import io
 import json
-from typing import Any
+import random
+from datetime import datetime, timedelta
 
 import pandas as pd
 
 try:
     from mistralai import Mistral
-except ImportError:  # Compatibility with older Mistral SDK layouts
+except ImportError:
     from mistralai.client import Mistral
-from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from datamint.config import get_settings
 from datamint.db.connection import get_connection
 
 
-class DatasetPayload(BaseModel):
-    columns: list[str] = Field(min_length=1)
-    data: list[list[Any]] = Field(min_length=1)
+def _extract_json(content: str) -> dict:
+    content = content.strip()
 
-    @field_validator("columns")
-    @classmethod
-    def unique_columns(cls, value: list[str]) -> list[str]:
-        if len(set(value)) != len(value):
-            raise ValueError("Column names must be unique.")
-        return value
+    if content.startswith("```json"):
+        content = content.removeprefix("```json").strip()
 
-    @field_validator("data")
-    @classmethod
-    def non_empty_rows(cls, value: list[list[Any]]) -> list[list[Any]]:
-        if not value:
-            raise ValueError("Dataset must include at least one row.")
-        return value
+    if content.startswith("```"):
+        content = content.removeprefix("```").strip()
 
-    def to_frame(self) -> pd.DataFrame:
-        return pd.DataFrame(self.data, columns=self.columns)
+    if content.endswith("```"):
+        content = content.removesuffix("```").strip()
+
+    return json.loads(content)
 
 
-def _dataset_prompt(features: int, rows: int, task: str, domain: str, description: str) -> str:
-    return f"""
-Generate a realistic synthetic tabular dataset.
+def generate_schema(features: int, task: str, domain: str, description: str) -> dict:
+    settings = get_settings()
 
-Requirements:
-- Domain: {domain}
-- Machine learning task: {task}
-- Number of columns/features: exactly {features}
-- Number of rows: exactly {rows}
-- User description: {description or "No extra description provided."}
-- Include realistic column names and plausible values.
-- Avoid personally identifiable information such as real names, emails, phone numbers, addresses, national IDs, or account numbers.
-- Make the target/label column clear when the selected machine learning task needs one.
-- Return only valid JSON. Do not include Markdown, comments, or explanation.
+    if not settings.mistral_api_key:
+        raise ValueError("MISTRAL_API_KEY is missing. Add it to .env or .streamlit/secrets.toml.")
 
-Required JSON shape:
+    prompt = f"""
+You are creating a synthetic dataset schema.
+
+Create exactly {features} columns for a {domain} dataset used for {task}.
+
+Dataset description:
+{description}
+
+Return ONLY valid JSON. No markdown. No explanation.
+
+Use this exact JSON format:
 {{
-  "columns": ["col1", "col2"],
-  "data": [
-    ["value", 1],
-    ["value", 2]
+  "columns": [
+    {{
+      "name": "column_name",
+      "type": "integer | float | category | date | text | boolean",
+      "min": 0,
+      "max": 100,
+      "categories": ["A", "B", "C"],
+      "description": "short meaning of this column"
+    }}
   ]
 }}
-""".strip()
 
-
-def _validate_dimensions(payload: DatasetPayload, features: int, rows: int) -> pd.DataFrame:
-    frame = payload.to_frame()
-    if frame.shape[1] != features:
-        raise ValueError(f"Expected {features} features but received {frame.shape[1]} columns.")
-    if len(frame) != rows:
-        raise ValueError(f"Expected {rows} rows but received {len(frame)} rows.")
-    return frame
-
-
-def generate_dataset(features: int, rows: int, task: str, domain: str, description: str) -> pd.DataFrame:
-    settings = get_settings()
-    if not settings.mistral_api_key:
-        raise RuntimeError("MISTRAL_API_KEY is missing. Add it to .env or .streamlit/secrets.toml.")
+Rules:
+- Return exactly {features} columns.
+- Do not include an index, id, row_id, or serial number column.
+- For integer and float columns, include min and max.
+- For category columns, include categories.
+- For boolean columns, no min, max, or categories are needed.
+- For date columns, no min, max, or categories are needed.
+- For text columns, include a short description.
+- Make columns realistic for the selected domain and task.
+"""
 
     client = Mistral(api_key=settings.mistral_api_key)
+
     response = client.chat.complete(
         model=settings.mistral_model,
-        messages=[
-            {
-                "role": "system",
-                "content": "You generate safe synthetic datasets and always return strict JSON only.",
-            },
-            {
-                "role": "user",
-                "content": _dataset_prompt(features, rows, task, domain, description),
-            },
-        ],
-        temperature=0.6,
-        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
         response_format={"type": "json_object"},
     )
-    raw = response.choices[0].message.content or "{}"
 
-    try:
-        payload = DatasetPayload.model_validate_json(raw)
-        return _validate_dimensions(payload, features, rows)
-    except (ValidationError, json.JSONDecodeError) as exc:
-        raise ValueError("Mistral returned invalid dataset JSON. Please try again with a clearer description.") from exc
+    raw = response.choices[0].message.content
+    schema = _extract_json(raw)
+
+    if "columns" not in schema:
+        raise ValueError("Mistral did not return a valid schema.")
+
+    columns = schema["columns"]
+
+    if len(columns) != features:
+        raise ValueError(f"Expected {features} columns but received {len(columns)} columns.")
+
+    return schema
 
 
-def save_dataset_metadata(user_id: int, task: str, domain: str, rows: int, features: int, description: str, columns: list[str]) -> None:
+def _generate_value(column: dict, row_index: int):
+    column_type = str(column.get("type", "category")).lower().strip()
+
+    if column_type == "integer":
+        min_value = int(column.get("min", 0))
+        max_value = int(column.get("max", 100))
+        return random.randint(min_value, max_value)
+
+    if column_type == "float":
+        min_value = float(column.get("min", 0))
+        max_value = float(column.get("max", 100))
+        return round(random.uniform(min_value, max_value), 2)
+
+    if column_type == "category":
+        categories = column.get("categories") or ["A", "B", "C"]
+        return random.choice(categories)
+
+    if column_type == "boolean":
+        return random.choice([True, False])
+
+    if column_type == "date":
+        start_date = datetime.today() - timedelta(days=365 * 3)
+        random_days = random.randint(0, 365 * 3)
+        return (start_date + timedelta(days=random_days)).date().isoformat()
+
+    if column_type == "text":
+        name = column.get("name", "text")
+        return f"{name}_sample_{row_index + 1}"
+
+    return random.choice(["A", "B", "C"])
+
+
+def generate_rows_from_schema(schema: dict, rows: int) -> pd.DataFrame:
+    columns = schema["columns"]
+    column_names = [column["name"] for column in columns]
+
+    data = []
+
+    for row_index in range(rows):
+        row = [_generate_value(column, row_index) for column in columns]
+        data.append(row)
+
+    return pd.DataFrame(data, columns=column_names)
+
+
+def validate_dataframe(
+    df: pd.DataFrame,
+    expected_features: int,
+    expected_rows: int,
+) -> pd.DataFrame:
+    if df.empty:
+        raise ValueError("Generated dataset is empty.")
+
+    if len(df.columns) != expected_features:
+        raise ValueError(
+            f"Expected {expected_features} columns but received {len(df.columns)} columns."
+        )
+
+    if len(df) != expected_rows:
+        raise ValueError(
+            f"Expected {expected_rows} rows but received {len(df)} rows."
+        )
+
+    return df
+
+
+def generate_dataset(
+    features: int,
+    rows: int,
+    task: str,
+    domain: str,
+    description: str,
+) -> pd.DataFrame:
+    schema = generate_schema(
+        features=features,
+        task=task,
+        domain=domain,
+        description=description,
+    )
+
+    df = generate_rows_from_schema(schema=schema, rows=rows)
+
+    return validate_dataframe(
+        df=df,
+        expected_features=features,
+        expected_rows=rows,
+    )
+
+
+def save_dataset_metadata(
+    user_id: int,
+    task: str,
+    domain: str,
+    rows: int,
+    features: int,
+    description: str,
+    columns: list[str],
+) -> None:
+    columns_json = json.dumps(columns)
+
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
             INSERT INTO generated_datasets
-            (user_id, task, domain, rows_requested, features_requested, description, columns_json)
+            (
+                user_id,
+                task,
+                domain,
+                rows_requested,
+                features_requested,
+                description,
+                columns_json
+            )
             VALUES (%s, %s, %s, %s, %s, %s, %s)
             """,
-            (user_id, task, domain, rows, features, description, json.dumps(columns)),
+            (
+                user_id,
+                task,
+                domain,
+                rows,
+                features,
+                description,
+                columns_json,
+            ),
         )
         cursor.close()
 
 
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="dataset")
-    return buffer.getvalue()
+    output = io.BytesIO()
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Dataset")
+
+    return output.getvalue()
